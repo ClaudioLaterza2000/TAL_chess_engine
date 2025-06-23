@@ -242,14 +242,16 @@ def main():
             # key handler
             elif e.type == p.KEYDOWN:
                 if e.key == p.K_z:  # undo when 'z' is pressed
+                    # undo both sides (AI + human) if you're doing full undos; otherwise just one
                     game_state.undoMove()
-                    move_made = True
-                    animate = False
-                    game_over = False
-                    if ai_thinking:
-                        move_finder_process.terminate()
-                        ai_thinking = False
-                    move_undone = True
+                    game_state.undoMove()
+                    # recalc moves and clear all turn/animation flags
+                    valid_moves = game_state.getValidMoves()
+                    move_made    = False
+                    animate      = False
+                    move_undone  = False   # allow AI to respond to your next move
+                    ai_thinking  = False
+
                 if e.key == p.K_r:  # reset the game when 'r' is pressed
                     game_state = TAL.GameState()
                     valid_moves = game_state.getValidMoves()
@@ -258,13 +260,14 @@ def main():
                     move_made = False
                     animate = False
                     game_over = False
-                    white_time = 600      # reset white timer
-                    black_time = 600      # reset black timer
-                    timeout_message = "" # clear game over message
-                    if ai_thinking:
+                    move_undone = False            # ← ADD THIS
+                    ai_thinking = False            # make sure any old AI‐threads are off
+                    white_time = 600               # reset timers
+                    black_time = 600
+                    timeout_message = ""           # clear any “time’s up” message
+                    # if there was a background process still alive, kill it
+                    if 'move_finder_process' in locals() and move_finder_process.is_alive():
                         move_finder_process.terminate()
-                        ai_thinking = False
-                    move_undone = True
                 if e.key == p.K_f:  # start FEN entry
                     fen_input_mode = True
                     fen_input_text = ""
@@ -291,18 +294,20 @@ def main():
                 ai_thinking = False
 
         if move_made:
+            if animate:
+                animateMove(game_state.move_log[-1], screen, game_state, clock)
+            valid_moves = game_state.getValidMoves()
+            castles = [m for m in valid_moves if m.is_castle_move]
+            move_made = False
+            animate    = False
             # print("Castling rights right now:",
             #     game_state.current_castling_rights.wks,
             #     game_state.current_castling_rights.wqs,
             #     game_state.current_castling_rights.bks,
             #     game_state.current_castling_rights.bqs)
-            valid_moves = game_state.getValidMoves()
-            castles = [m for m in valid_moves if m.is_castle_move]
             # print("Valid castle moves currently:", [(m.start_row,m.start_col,m.end_row,m.end_col) for m in castles])
 
 
-            move_made = False
-            move_undone = False
 
         screen.fill(p.Color("black"))
         drawGameState(screen, game_state, valid_moves, square_selected)
@@ -568,7 +573,12 @@ def getPromotionChoice(screen, font, piece_color):
     options = ["Q", "R", "B", "N"]
     overlay = p.Surface((300, 100))
     overlay.fill(p.Color("gray"))
-    overlay_rect = overlay.get_rect(center=(BOARD_WIDTH/2, BOARD_HEIGHT/2))
+    # center inside the board, just like drawFenInput does
+    board_x0 = X_OFFSET + LEFT_PANEL_WIDTH
+    board_y0 = VERTICAL_OFFSET
+    overlay_rect = overlay.get_rect(
+        center=(board_x0 + BOARD_WIDTH//2, board_y0 + BOARD_HEIGHT//2)
+    )
     screen.blit(overlay, overlay_rect)
     
     option_rects = []
@@ -576,7 +586,12 @@ def getPromotionChoice(screen, font, piece_color):
     option_width = (300 - 5 * spacing) / 4
     y = overlay_rect.top + 20
     for i, option in enumerate(options):
-        rect = p.Rect(overlay_rect.left + spacing + i*(option_width+spacing), y, option_width, 60)
+        rect = p.Rect(
+            overlay_rect.left + spacing + i*(option_width+spacing),
+            y,
+            option_width,
+            60
+        )
         p.draw.rect(screen, p.Color("white"), rect)
         text_surface = font.render(option, True, p.Color("black"))
         text_rect = text_surface.get_rect(center=rect.center)
@@ -591,6 +606,7 @@ def getPromotionChoice(screen, font, piece_color):
                 for option, rect in option_rects:
                     if rect.collidepoint(pos):
                         return option
+
 
 
 def drawFenInput(screen, text, font):
@@ -617,6 +633,66 @@ def drawFenInput(screen, text, font):
         display = display[1:]
     txt_surf = font.render(display, True, p.Color('white'))
     screen.blit(txt_surf, (x+10, y + (box_h - txt_surf.get_height())//2))
+
+def animateMove(move, screen, game_state, clock):
+    """
+    Animate a move by sliding the moving piece from its start square to its end square.
+    """
+    frames_per_square = 10  # number of frames to move one square
+    d_row = move.end_row - move.start_row
+    d_col = move.end_col - move.start_col
+    frame_count = (abs(d_row) + abs(d_col)) * frames_per_square
+
+    # board colors must match drawBoard
+    colors = [p.Color("ivory"), p.Color("lightskyblue")]
+    board = game_state.board
+
+    for frame in range(frame_count + 1):
+        # fractional row/col for smooth interpolation
+        row = move.start_row + d_row * frame / frame_count
+        col = move.start_col + d_col * frame / frame_count
+
+        # redraw board and all pieces
+        drawBoard(screen)
+        drawPieces(screen, board, game_state)
+
+        # clear the destination square
+        dst_rect = p.Rect(
+            X_OFFSET + LEFT_PANEL_WIDTH + move.end_col * SQUARE_SIZE,
+            VERTICAL_OFFSET + move.end_row     * SQUARE_SIZE,
+            SQUARE_SIZE, SQUARE_SIZE
+        )
+        p.draw.rect(screen,
+                    colors[(move.end_row + move.end_col) % 2],
+                    dst_rect)
+
+        # if it was a capture, redraw the captured piece (excluding empty "-")
+        if move.piece_captured != '-':
+            if move.is_enpassant_move:
+                er = move.end_row + (1 if move.piece_captured[0] == 'b' else -1)
+                cap_rect = p.Rect(
+                    X_OFFSET + LEFT_PANEL_WIDTH + move.end_col * SQUARE_SIZE,
+                    VERTICAL_OFFSET + er              * SQUARE_SIZE,
+                    SQUARE_SIZE, SQUARE_SIZE
+                )
+            else:
+                cap_rect = dst_rect
+            screen.blit(IMAGES[move.piece_captured], cap_rect)
+
+        # draw the moving piece at its interpolated position
+        screen.blit(
+            IMAGES[move.piece_moved],
+            p.Rect(
+                X_OFFSET + LEFT_PANEL_WIDTH + col * SQUARE_SIZE,
+                VERTICAL_OFFSET + row             * SQUARE_SIZE,
+                SQUARE_SIZE, SQUARE_SIZE
+            )
+        )
+
+        p.display.flip()
+        clock.tick(60)
+
+
 
 
 if __name__ == "__main__":
