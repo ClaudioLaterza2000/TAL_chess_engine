@@ -1,12 +1,37 @@
+"""
+EVA (Evaluation + Search):
+
+Implements a mid-strength alpha-beta search with:
+ - Iterative deepening (principal variation seeding).
+ - Transposition table (flagged entries: EXACT / LOWER / UPPER).
+ - Principal Variation Search (PVS) / minimal-window re-search.
+ - Null-move pruning (depth reduction heuristic).
+ - Killer move + history heuristics for improved move ordering.
+ - Basic quiescence NOT implemented (tactical instability possible at leaves).
+ - Adaptive deeper search in late endgames (piece-count based).
+ - Evaluation blending for king piece-square tables (midgame→endgame interpolation).
+ - Additional heuristic bonuses:
+     * King centralization and proximity when ahead (encourages conversion).
+     * Piece-square bonuses from predefined tables.
+ - Easter-egg knight ('L') treated as standard knight for scoring.
+
+Design Considerations:
+ - Uses GameState.makeMove / undoMove for reversible search.
+ - Relies on current_fen from GameState as part of TT key (augmented by depth + side).
+ - Null-move pruning disabled in positions with low material or when in check.
+ - All scores from White's perspective (positive = advantage White).
+"""
+
 import random
 import math
 from collections import defaultdict
 from TAL import GameState
 
-# Material scores
+# --------------------- Base Material Scores ---------------------
 piece_score = {"P": 100, "N": 300, "B": 320, "R": 500, "Q": 900, "K": 0, "L": 300}
 
-# Piece-square tables
+# --------------------- Piece-Square Tables ----------------------
+# (Lead to positional bonuses encouraging development / center control)
 pawn_table = [[0, 0, 0, 0, 0, 0, 0, 0],
                 [50, 50, 50, 50, 50, 50, 50, 50],
                 [10, 10, 20, 30, 30, 20, 10, 10],
@@ -70,36 +95,40 @@ king_endgame_table = [[-20, -10, -10, -10, -10, -10, -10, -20],
                 [-30, -25,   0,   0,   0,   0, -25, -30],
                 [-50, -30, -30, -30, -30, -30, -30, -50]
 ]
-# We know there are 32 total pieces at start of the game, of which 2 are kings → 29 non‐king pieces.
-MAX_NON_KING_PIECES = 29
+
+MAX_NON_KING_PIECES = 29  # (32 - 2 kings - 1 self? kept as constant upper bound)
 
 _tables = {
     "P": pawn_table, "N": knight_table, "B": bishop_table,
     "R": rook_table, "Q": queen_table, "K": king_table,
     "L": knight_table  
 }
-CHECKMATE = 100000
+
+CHECKMATE = 100000    # Large sentinel for mate distance heuristics (not distance-scaled here)
 STALEMATE = 0
 
-# Transposition table with flags
-# each entry: tt[key] = {"value": val, "flag": "EXACT"/"LOWER"/"UPPER"}
+# --------------------- Transposition Table ----------------------
+# Structure: key → { value: int, flag: EXACT|LOWER|UPPER }
 _tt = {}
 
-# Killer and history heuristics
+# --------------------- Move Ordering Heuristics -----------------
+# Killer heuristic: two best non-capture killers per depth.
 _killers = defaultdict(lambda: [None, None])
+# History heuristic: frequency-weighted success of quiet moves.
 _history = defaultdict(int)
 
-# tune how strong the “center‐distance” and “king‐proximity” bonuses are:
+# King endgame heuristic weights
 CENTER_WEIGHT = 15
 PROX_WEIGHT   = 7
-# Maximum possible Manhattan distance between two kings on an empty 8×8 board:
 MAX_KING_MANHATTAN = 14
-import random
-import math
-from collections import defaultdict
-from TAL import GameState
 
 def findBestMove(gs, moves, return_queue, depth=4):
+    """Root search entry point.
+    Enhancements:
+      - Late endgame deepening (≤7 pieces → depth+2; ≤4 → depth+4).
+      - Mate-in-one pre-check.
+      - Iterative deepening + PV move reordering before full-depth root search.
+    Returns best move via inter-process Queue (for async integration)."""
     turn_white = gs.white_to_move
     best_move = None
     best_score = -math.inf if turn_white else math.inf
@@ -124,6 +153,12 @@ def findBestMove(gs, moves, return_queue, depth=4):
 
     # ─── define your recursive search ───
     def minimax(node, d, alpha, beta, max_player):
+        """Alpha-beta with:
+           - TT lookups & bound tightening
+           - Null-move pruning
+           - PVS (minimal window re-search)
+           - Killer/history updates on cutoffs
+           Leaf eval blends mid/endgame king tables and adds dynamic king bonuses."""
         alpha_orig = alpha
         key = f"{node.current_fen}|{d}|{int(max_player)}"
 
@@ -291,6 +326,9 @@ def findBestMove(gs, moves, return_queue, depth=4):
         moves.insert(0, pv_move)
 
     def root_move_key(m):
+        """Ordering score for root moves:
+           Captures prioritized by MVV-LVA style (material swing),
+           Then killers/history for quiets."""
         sc = 0
         if m.is_capture:
             sc += 10000 + piece_score[m.piece_captured.upper()] - piece_score[m.piece_moved.upper()]

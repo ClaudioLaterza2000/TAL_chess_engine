@@ -1,11 +1,34 @@
 """
-Storing all the information about the current state of chess game.
-Determining valid moves at current state.
-It will keep move log.
+Engine core: board representation, state tracking, move execution, legality filtering,
+draw detection (50‑move, repetition, insufficient material), and move generation.
+
+Board Representation:
+ 8x8 list of single-character piece codes. Uppercase = White, lowercase = Black.
+ '-' represents an empty square. Promotion easter-egg knights use 'L'/'l'.
+
+Key Responsibilities:
+ - Parse + emit FEN (limited: only board + active + castling + en passant + half/fullmove).
+ - Track incremental state (king locations, castling rights, en passant targets, logs).
+ - Provide legal move list with pin & check resolution.
+ - Detect terminal states (checkmate / stalemate / draws).
+ - Support reversible make/undo with full restoration of auxiliary logs.
+
+Design Notes:
+ - Move objects are immutable after creation (except optional promotion_choice).
+ - Board repetition keyed only by piece placement + side-to-move (castling/en-passant
+   omitted intentionally for simplified threefold detection).
+ - Castling logic validates squares are not attacked via squareUnderAttack probing.
+ - Fifty-move counter counts “half-moves” per FIDE rule (100 threshold = draw).
+
+Performance Considerations:
+ - Pins & checks detected once per legality cycle then reused in piece move generation.
+ - UndoMove reverses logs in strict LIFO order; any new state added must push/pop its log twin.
 """
 
+# --------------------------- FEN Helpers ---------------------------
 def fen_to_board(fen):
-    """Parse FEN board into 8×8 list of one-char codes or '-'."""
+    """Parse FEN board-part into 8×8 array of single-char piece codes or '-'.
+    Only the first field of the FEN is used here; higher fields handled elsewhere."""
     board_part = fen.split()[0]
     rows = board_part.split('/')
     board = []
@@ -21,7 +44,7 @@ def fen_to_board(fen):
 
 
 def board_to_fen(board):
-    """Convert 8×8 list of one-char codes or '-' back to FEN board part."""
+    """Serialize internal board array back to the FEN board-part (no side/counters)."""
     fen_rows = []
     for row in board:
         empty = 0
@@ -44,9 +67,17 @@ INITIAL_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
 
 class GameState:
-    """Store current chess state using FEN one-char codes."""
+    """Mutable container for the current position + auxiliary rule state.
+    Public Methods Overview:
+      makeMove / undoMove  : forward & backward state transitions.
+      getValidMoves        : full legal move list (includes castling/filtering).
+      getAllPossibleMoves  : pseudo-legal generator (ignores self-check).
+      inCheck / squareUnderAttack : tactical probes.
+      insufficientMaterial : minimal material draw evaluator.
+    """
     def __init__(self, fen=INITIAL_FEN):
 
+        # ── FEN field normalization (pads missing fields with defaults) ──
         # split FEN into fields and pad to 6 parts: board, active, castling, ep, half, full
         parts = fen.strip().split()
         defaults = ['-', '-', '0', '1']  # castling, ep, halfmove, fullmove
@@ -63,13 +94,13 @@ class GameState:
                     self.white_king_location = (r, c)
                 elif self.board[r][c] == 'k':
                     self.black_king_location = (r, c)
-        # map single-char piece to move-getter:
+        # Move dispatch table; 'l'/'L' (easter-egg promoted knight) reuses knight logic.
         self.moveFunctions = {
             'p': self.getPawnMoves, 'r': self.getRookMoves, 'n': self.getKnightMoves,
             'b': self.getBishopMoves, 'q': self.getQueenMoves, 'k': self.getKingMoves,
             'l': self.getKnightMoves
         }
-        # active colour from FEN
+        # Active side derived from FEN field[1]
         self.white_to_move = (fields[1] == 'w')
         self.move_log = []
         #self.white_king_location = (7, 4)
@@ -91,16 +122,17 @@ class GameState:
         self.board_key_log = []
         key = self.getBoardKey()
         self.board_position_counts[key] = 1
-        # track the coordinates of any pawn→knight promotions
+        # Easter egg: track coordinates of promoted special knights to adjust rendering if needed.
         self.easter_knights = set()
 
     def getBoardKey(self):
-        """Return a string key representing the board and turn."""
+        """Return simplified repetition key (piece placement + side).
+        Note: intentionally excludes castling/en-passant for relaxed repetition heuristic."""
         board_str = "".join(["".join(row) for row in self.board])
         return board_str + ("w" if self.white_to_move else "b")
 
     def updateFiftyMoveCounter(self, move):
-        """Reset counter if pawn moved or a capture occurred; otherwise increment."""
+        """Increment or reset the fifty-move counter (reset on pawn move or capture)."""
         # ─── First, save the old fifty‐move value onto the log ───
         self.fifty_move_log.append(self.fifty_move_counter)
 
@@ -110,6 +142,7 @@ class GameState:
             self.fifty_move_counter += 1
 
     def updateRepetition(self):
+        """Record current position key; used for (approximate) threefold repetition."""
         key = self.getBoardKey()
         # ─── Push this key onto board_key_log so undoMove can revert it ───
         self.board_key_log.append(key)
@@ -120,19 +153,14 @@ class GameState:
             self.board_position_counts[key] = 1
 
     def checkThreefoldRepetition(self):
-        """Return True if any board position has occurred at least 3 times."""
+        """Return True if any recorded position key occurred ≥ 3 times."""
         for count in self.board_position_counts.values():
             if count >= 3:
                 return True
         return False
 
     def insufficientMaterial(self):
-        """
-        Return True if neither player has enough material to mate:
-           - Kings only,
-           - King and Knight vs King,
-           - King and Bishop vs King.
-        """
+        """Detect theoretical impossibility of checkmate under reduced material cases."""
         # Gather all remaining pieces on the board
         pieces = [p for row in self.board for p in row if p != '-']
         # Filter out the two kings
@@ -152,7 +180,7 @@ class GameState:
 
         return False
     def update_fen(self):
-        """Rebuild full FEN string after each move/undo."""
+        """Reconstruct full FEN string (used by search layer for hashing/TT)."""
         # board part
         board_part = board_to_fen(self.board)
         # active color
@@ -175,10 +203,13 @@ class GameState:
         full = len(self.move_log) // 2 + 1
         self.current_fen = f"{board_part} {active} {cr} {ep} {half} {full}"
 
+    # ---------------------- Move Execution ----------------------
     def makeMove(self, move):
-        """
-        Takes a Move as a parameter and executes it.
-        """
+        """Apply a Move:
+           - Updates board, king loci, special moves (promotion, en passant, castling),
+             logs (move, en passant, castling, repetition, fifty-move).
+           - Does NOT validate legality (caller must use getValidMoves)."""
+        # Piece relocation
         # (this will not work for castling, pawn promotion and en-passant)
         self.board[move.start_row][move.start_col] = '-'
         self.board[move.end_row][move.end_col] = move.piece_moved
@@ -272,7 +303,7 @@ class GameState:
             self.board[r][dst_rook_col] = self.board[r][src_rook_col]
             self.board[r][src_rook_col] = '-'
 
-        # ── Slide the Easter‐egg marker with its knight ──
+        # Track moved promoted knights for optional custom rendering.
         if move.piece_moved.upper() == 'N' and (move.start_row, move.start_col) in self.easter_knights:
             self.easter_knights.remove((move.start_row, move.start_col))
             self.easter_knights.add((move.end_row, move.end_col))
@@ -298,10 +329,14 @@ class GameState:
         self.update_fen()  # rename/update FEN
 
     def undoMove(self):
-        """
-        Undo the last move, restoring board, side to move, castling rights,
-        en-passant, the fifty-move counter, and repetition counts.
-        """
+        """Reverse last move; restores:
+           - board & king positions
+           - repetition counts
+           - fifty-move counter
+           - en passant target
+           - castling rights
+           - rook movement from castling
+        Safe no-op if move_log empty."""
         if not self.move_log:
             return
 
@@ -385,11 +420,7 @@ class GameState:
         self.update_fen()
 
     def updateCastleRights(self, move):
-        """
-        Update the castle rights given the move.
-        Only clear a castling‐side if an actual rook on a1/h1 or a8/h8
-        was moved or captured, OR if the king itself moved.
-        """
+        """Adjust castling rights only when a rook/king moves or rook is captured on its home square."""
         # White’s queen‐side: only if a White rook on a1 was captured
         if move.piece_captured == 'R' and move.end_row == 7 and move.end_col == 0:
             self.current_castling_rights.wqs = False
@@ -431,13 +462,13 @@ class GameState:
             elif move.start_row == 0 and move.start_col == 7:
                 self.current_castling_rights.bks = False
 
-
-
-
+    # ---------------------- Move Generation (Legal) ----------------------
     def getValidMoves(self):
-        """
-        All moves considering checks.
-        """
+        """Return list of legal Move objects after:
+           - generating pseudo moves
+           - filtering via check / pin logic
+           - adding castling if legal
+           - enforcing draws (mate/stalemate flags set)."""
         temp_castle_rights = CastleRights(self.current_castling_rights.wks, self.current_castling_rights.bks,
                                           self.current_castling_rights.wqs, self.current_castling_rights.bqs)
         # advanced algorithm
@@ -535,18 +566,14 @@ class GameState:
         # return moves
 
     def inCheck(self):
-        """
-        Determine if a current player is in check
-        """
+        """Return True if side-to-move's king is currently attacked."""
         if self.white_to_move:
             return self.squareUnderAttack(self.white_king_location[0], self.white_king_location[1])
         else:
             return self.squareUnderAttack(self.black_king_location[0], self.black_king_location[1])
 
     def squareUnderAttack(self, row, col):
-        """
-        Determine if enemy can attack the square row col
-        """
+        """Probe if (row,col) is attacked by flipping side and scanning their pseudo moves."""
         self.white_to_move = not self.white_to_move  # switch to opponent's point of view
         opponents_moves = self.getAllPossibleMoves()
         self.white_to_move = not self.white_to_move
@@ -555,10 +582,9 @@ class GameState:
                 return True
         return False
 
+    # ---------------------- Move Generation (Pseudo) ----------------------
     def getAllPossibleMoves(self):
-        """
-        All moves without considering checks.
-        """
+        """Generate pseudo-legal moves (no self-check filtering)."""
         moves = []
         for r in range(8):
             for c in range(8):
@@ -570,6 +596,10 @@ class GameState:
         return moves
 
     def checkForPinsAndChecks(self):
+        """Scan outward from king to classify:
+           - pins (ally pieces that cannot move off ray)
+           - checks (enemy pieces directly attacking king)
+        Also detects knight attacks separately."""
         pins = []  # squares pinned and the direction its pinned from
         checks = []  # squares where enemy is applying a check
         in_check = False
@@ -637,10 +667,9 @@ class GameState:
                     checks.append((end_row, end_col, move[0], move[1]))
         return in_check, pins, checks
 
+    # Piece-type specific generators below; each respects current pin context.
     def getPawnMoves(self, row, col, moves):
-        """
-        Get all the pawn moves for the pawn located at row, col and add the moves to the list.
-        """
+        """Add legal pawn advances, captures, en passant (with discovered-check safety)."""
         piece_pinned = False
         pin_direction = ()
         for i in range(len(self.pins) - 1, -1, -1):
@@ -742,9 +771,7 @@ class GameState:
                                     is_enpassant_move=True))
 
     def getRookMoves(self, row, col, moves):
-        """
-        Get all the rook moves for the rook located at row, col and add the moves to the list.
-        """
+        """Sliding horizontal/vertical rook moves with pin respect."""
         piece_pinned = False
         pin_direction = ()
         for i in range(len(self.pins) - 1, -1, -1):
@@ -780,9 +807,7 @@ class GameState:
                     break
 
     def getKnightMoves(self, row, col, moves):
-        """
-        Get all the knight moves for the knight located at row col and add the moves to the list.
-        """
+        """Knight L-moves (ignore pins except removal bookkeeping)."""
         piece_pinned = False
         for i in range(len(self.pins) - 1, -1, -1):
             if self.pins[i][0] == row and self.pins[i][1] == col:
@@ -805,9 +830,7 @@ class GameState:
                         moves.append(Move((row, col), (end_row, end_col), self.board))
 
     def getBishopMoves(self, row, col, moves):
-        """
-        Get all the bishop moves for the bishop located at row col and add the moves to the list.
-        """
+        """Diagonal sliding bishop moves with pin respect."""
         piece_pinned = False
         pin_direction = ()
         for i in range(len(self.pins) - 1, -1, -1):
@@ -838,16 +861,12 @@ class GameState:
                     break
 
     def getQueenMoves(self, row, col, moves):
-        """
-        Get all the queen moves for the queen located at row col and add the moves to the list.
-        """
+        """Queen = bishop + rook moves (delegates)."""
         self.getBishopMoves(row, col, moves)
         self.getRookMoves(row, col, moves)
 
     def getKingMoves(self, row, col, moves):
-        """
-        Get all the king moves for the king located at row col and add the moves to the list.
-        """
+        """Single-step king moves; temporarily relocates king to test exposure."""
         row_moves = (-1, -1, -1, 0, 0, 1, 1, 1)
         col_moves = (-1, 0, 1, -1, 1, -1, 0, 1)
         ally_color = "w" if self.white_to_move else "b"
@@ -874,9 +893,7 @@ class GameState:
                         self.black_king_location = (row, col)
 
     def getCastleMoves(self, row, col, moves):
-        """
-        Generate all valid castle moves for the king at (row, col) and add them to the list of moves.
-        """
+        """Wrapper: conditionally add king/queen side castle if rights & path safe."""
         if self.squareUnderAttack(row, col):
             return  # can't castle while in check
         if (self.white_to_move and self.current_castling_rights.wks) or (
@@ -887,14 +904,7 @@ class GameState:
             self.getQueensideCastleMoves(row, col, moves)
 
     def getKingsideCastleMoves(self, row, col, moves):
-        """
-        Only append a kingside‐castle if:
-            The king is on its home square (e1 for White; e8 for Black).
-            The corresponding rook is on its home square (h1/h8).
-            The two squares between king and rook are empty.
-            Those squares, and the king's starting square, are not under attack.
-            The side still has king‐side castling rights.
-        """
+        """Validate kingside castle preconditions (rook presence, empties, attack-free path)."""
         # (A) Determine which color we're talking about:
         if self.white_to_move:
             # White’s home‐rank is 7; home‐file is 4 (e1).
@@ -935,14 +945,7 @@ class GameState:
 
 
     def getQueensideCastleMoves(self, row, col, moves):
-        """
-        Only append a queenside‐castle if:
-          The king is on its home square (e1 for White; e8 for Black).
-          The corresponding rook is on its home square (a1/a8).
-          The three squares between king and rook are empty.
-          Those squares, and the square the king passes through, are not under attack.
-          The side still has queen‐side castling rights.
-        """
+        """Validate queenside castle preconditions (rook presence, empties, attack-free path)."""
         if self.white_to_move:
             # White’s home‐rank is 7; home‐file is 4 (e1).
             if row != 7 or col != 4:
@@ -982,6 +985,7 @@ class GameState:
 
 
 class CastleRights:
+    """Lightweight struct for current available castling sides."""
     def __init__(self, wks, bks, wqs, bqs):
         self.wks = wks
         self.bks = bks
@@ -990,9 +994,14 @@ class CastleRights:
 
 
 class Move:
-    # in chess, fields on the board are described by two symbols, one of them being number between 1-8 (which is corresponding to rows)
-    # and the second one being a letter between a-f (corresponding to columns), in order to use this notation we need to map our [row][col] coordinates
-    # to match the ones used in the original chess game
+    """Immutable representation of a move (except optional promotion_choice later).
+    Includes flags for:
+      - pawn promotion
+      - en passant
+      - castling
+      - capture
+    moveID used for quick equality (compact encoding of coordinates)."""
+    # Mapping dictionaries (rank/file conversion).
     ranks_to_rows = {"1": 7, "2": 6, "3": 5, "4": 4,
                      "5": 3, "6": 2, "7": 1, "8": 0}
     rows_to_ranks = {v: k for k, v in ranks_to_rows.items()}
@@ -1001,6 +1010,7 @@ class Move:
     cols_to_files = {v: k for k, v in files_to_cols.items()}
 
     def __init__(self, start_square, end_square, board, is_enpassant_move=False, is_castle_move=False):
+        # Derive moved/captured pieces + classify special move flags.
         self.start_row = start_square[0]
         self.start_col = start_square[1]
         self.end_row = end_square[0]
@@ -1020,14 +1030,13 @@ class Move:
         self.moveID = self.start_row * 1000 + self.start_col * 100 + self.end_row * 10 + self.end_col
 
     def __eq__(self, other):
-        """
-        Overriding the equals method.
-        """
+        """Equality: same encoded moveID."""
         if isinstance(other, Move):
             return self.moveID == other.moveID
         return False
 
     def getChessNotation(self):
+        """Return simplified algebraic-ish string (no disambiguation, minimal SAN subset)."""
         if self.is_pawn_promotion:
             return self.getRankFile(self.end_row, self.end_col) + "Q"
         if self.is_castle_move:
@@ -1050,12 +1059,12 @@ class Move:
             return self.getRankFile(self.end_row, self.end_col)
         return self.piece_moved.upper() + self.getRankFile(self.end_row, self.end_col)
 
-        # TODO Disambiguating moves
-
     def getRankFile(self, row, col):
+        """Convert (row,col) → algebraic coordinate like 'e4'."""
         return self.cols_to_files[col] + self.rows_to_ranks[row]
 
     def __str__(self):
+        """Readable form with capture/promotion/castle shorthand."""
         if self.is_castle_move:
             return "0-0" if self.end_col == 6 else "0-0-0"
         end_square = self.getRankFile(self.end_row, self.end_col)

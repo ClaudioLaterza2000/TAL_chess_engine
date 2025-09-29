@@ -1,8 +1,31 @@
 """
-Main driver file.
-Handling user input.
-Displaying current GameStatus object.
+Main application - pygame UI layer:
+
+Responsibilities:
+ - Initialize fullscreen adaptive layout (board centered with left/right sidebars).
+ - Handle human input (mouse clicks → move selection; keyboard shortcuts).
+ - Manage per-side countdown clocks and timeouts.
+ - Provide FEN input overlay (paste/type + Enter to apply).
+ - Invoke engine search asynchronously (multiprocessing) for AI turns.
+ - Draw layered UI: board, pieces, highlights, side panels, overlays, animations.
+
+Design Points:
+ - Screen scaling recalculated on startup for current resolution.
+ - Separation between game state (TAL.GameState) and presentation.
+ - Promotion choice collected synchronously via modal overlay (blocks until selection).
+ - Undo (z) reverts two plies (human + AI) for convenience.
+ - AI search uses a Process to avoid blocking frame loop; polling for completion.
+
+Performance:
+ - Redraw each frame; minimal optimization (sufficient for small board).
+ - Animation interpolates piece position per frame for smooth movement.
+
+Input Modes:
+ - Normal (click-select squares) vs FEN entry overlay (captures key events only).
+
 """
+
+# -------------------- Imports & Constants --------------------
 import os
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "1" # pd: partito democatico
 import pygame as p
@@ -37,8 +60,8 @@ VERTICAL_OFFSET = 15
 
 
 def loadImages():
+    """Load and cache piece sprites (standard + easter-egg promotion)."""
 
-    
     """
     Initialize a global directory of images.
     This will be called exactly once in the main.
@@ -62,6 +85,7 @@ def loadImages():
 
 
 def get_clipboard_text():
+    """Return clipboard text via pyperclip (fallbacks removed for simplicity)."""
     """
     Cross-platform clipboard text retrieval using pyperclip.
     """
@@ -91,7 +115,9 @@ def get_clipboard_text():
     # return ""
 
 
+# -------------------- Main Loop --------------------
 def main():
+    """Initialize UI, enter event/render/update loop until quit."""
     p.init()
     p.font.init()
     global FONT_LARGE, FONT_MEDIUM, FONT_SMALL
@@ -143,7 +169,7 @@ def main():
     font_input = p.font.SysFont("Consolas", 20)
 
     while running:
-        # compute actual elapsed seconds
+        # Compute frame delta time for accurate clock decrement
         curr_time = p.time.get_ticks()
         dt = (curr_time - prev_time) / 1000.0
         prev_time = curr_time
@@ -161,6 +187,7 @@ def main():
         human_turn = (game_state.white_to_move and player_one) or (not game_state.white_to_move and player_two)
 
         for e in p.event.get():
+            # FEN overlay steals focus: only handle key events until exit
             if fen_input_mode:
                 if e.type == p.KEYDOWN:
                     mods = e.mod
@@ -241,6 +268,11 @@ def main():
 
             # key handler
             elif e.type == p.KEYDOWN:
+                # Keyboard shortcuts:
+                #  z = double undo (human + AI)
+                #  r = hard reset
+                #  f = enter FEN input mode
+                #  q = quit
                 if e.key == p.K_z:  # undo when 'z' is pressed
                     # undo both sides (AI + human) if you're doing full undos; otherwise just one
                     game_state.undoMove()
@@ -277,6 +309,8 @@ def main():
                     sys.exit()
 
 
+        # ---------------- AI Turn Handling ----------------
+        # Spawn search process once; poll until done; fallback to random if None
         if not game_over and not human_turn and not move_undone:
             if not ai_thinking:
                 ai_thinking = True
@@ -293,6 +327,7 @@ def main():
                 animate = True
                 ai_thinking = False
 
+        # Apply and animate last move
         if move_made:
             if animate:
                 animateMove(game_state.move_log[-1], screen, game_state, clock)
@@ -309,6 +344,8 @@ def main():
 
 
 
+        # ---------------- Drawing Phase ----------------
+        # Layer: background → board/pieces → sidebars → overlays → endgame text
         screen.fill(p.Color("black"))
         drawGameState(screen, game_state, valid_moves, square_selected)
         drawLeftSidebar(screen, game_state)
@@ -333,10 +370,7 @@ def main():
         p.display.flip()
 
 def drawGameState(screen, game_state, valid_moves, square_selected):
-    """
-    Draw just the 8×8 board, the highlights, and the pieces.
-    The left & right sidebars are drawn separately.
-    """
+    """Composite draw: board grid, highlights, pieces."""
     # 1) the squares + rank-files
     drawBoard(screen)
 
@@ -348,6 +382,7 @@ def drawGameState(screen, game_state, valid_moves, square_selected):
 
 
 def drawBoard(screen):
+    """Draw 8x8 squares + file labels bar."""
     # 1) squares
     colors = [p.Color("ivory"), p.Color("lightskyblue")]
     for r in range(DIMENSION):
@@ -372,6 +407,7 @@ def drawBoard(screen):
 
 
 def highlightSquares(screen, game_state, valid_moves, sq_sel):
+    """Highlight last move, selected piece, and its legal destinations."""
     x0 = X_OFFSET + LEFT_PANEL_WIDTH
     # last move in translucent green
     if game_state.move_log:
@@ -398,6 +434,7 @@ def highlightSquares(screen, game_state, valid_moves, sq_sel):
                                     m.end_row * SQUARE_SIZE + VERTICAL_OFFSET))
 
 def drawPieces(screen, board, game_state):
+    """Blit piece sprites; uses special key mapping if needed."""
     x0 = X_OFFSET + LEFT_PANEL_WIDTH
     for r in range(DIMENSION):
         for c in range(DIMENSION):
@@ -418,6 +455,7 @@ def drawPieces(screen, board, game_state):
 
 
 def drawEndGameText(screen, text):
+    """Centered shadowed overlay for terminal messages."""
     font = p.font.SysFont("Helvetica", 32, True, False)
     to = font.render(text, True, p.Color("black"))
     w,h = to.get_size()
@@ -429,6 +467,7 @@ def drawEndGameText(screen, text):
 
 
 def evaluateBoard(game_state):
+    """Static evaluation helper (unused in release UI; preserved for debugging)."""
     score = 0
     for r in range(8):
         for c in range(8):
@@ -443,9 +482,7 @@ def evaluateBoard(game_state):
 
 
 def drawLeftSidebar(screen, game_state):
-    """
-    Left panel:  two‐column SAN history, larger fonts.
-    """
+    """Render rank labels + two-column move history (incremental SAN-ish)."""
     # 1) background
     p.draw.rect(screen, p.Color('black'),
                 (X_OFFSET, 0, LEFT_PANEL_WIDTH, BOARD_HEIGHT))
@@ -493,10 +530,7 @@ def drawLeftSidebar(screen, game_state):
 
 
 def drawRightSidebar(screen, game_state, white_time, black_time):
-    """
-    Right panel (LEFT_PANEL_WIDTH+BOARD_WIDTH → end):
-      timers, eval, best, turn, cmds.
-    """
+    """Render timers, best-move suggestion (shallow), side-to-move, and command list."""
     px = X_OFFSET + LEFT_PANEL_WIDTH + BOARD_WIDTH
     p.draw.rect(screen, p.Color('black'),
                 (px, 0, RIGHT_PANEL_WIDTH, BOARD_HEIGHT))
@@ -566,10 +600,7 @@ def drawRightSidebar(screen, game_state, white_time, black_time):
 
 
 def getPromotionChoice(screen, font, piece_color):
-    """
-    Draw an overlay on screen asking the user to choose a promotion piece.
-    Returns the chosen piece letter ("Q", "R", "B", or "N").
-    """
+    """Modal overlay presenting promotion choices (Q R B N). Blocks until clicked."""
     options = ["Q", "R", "B", "N"]
     overlay = p.Surface((300, 100))
     overlay.fill(p.Color("gray"))
@@ -610,7 +641,7 @@ def getPromotionChoice(screen, font, piece_color):
 
 
 def drawFenInput(screen, text, font):
-    """Draw a centered, bordered input box and current FEN text."""
+    """Centered semi-transparent input box; trims overflowing text from left."""
     box_w, box_h = BOARD_WIDTH - 100, 40
     # center within board (account for horizontal & vertical offsets)
     board_x0 = X_OFFSET + LEFT_PANEL_WIDTH
@@ -635,9 +666,7 @@ def drawFenInput(screen, text, font):
     screen.blit(txt_surf, (x+10, y + (box_h - txt_surf.get_height())//2))
 
 def animateMove(move, screen, game_state, clock):
-    """
-    Animate a move by sliding the moving piece from its start square to its end square.
-    """
+    """Interpolated piece animation from start → end square (captures handled visually)."""
     frames_per_square = 10  # number of frames to move one square
     d_row = move.end_row - move.start_row
     d_col = move.end_col - move.start_col
